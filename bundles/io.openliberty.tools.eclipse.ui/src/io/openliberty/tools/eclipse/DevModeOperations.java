@@ -12,19 +12,24 @@
 *******************************************************************************/
 package io.openliberty.tools.eclipse;
 
+import java.awt.Desktop;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -68,6 +73,10 @@ public class DevModeOperations {
     /**
      * Constants.
      */
+    public static final String LOG_TYPE_MESSAGES = "messages";
+    public static final String LOG_TYPE_TRACE = "trace";
+    public static final String LOG_TYPE_FFDC = "ffdc";
+
     public static final String DEVMODE_START_PARMS_DIALOG_TITLE = Messages.getMessage("devmode_start_dialog_title");
     public static final String DEVMODE_START_PARMS_DIALOG_MSG = Messages.getMessage("devmode_start_dialog_msg");
 
@@ -1164,6 +1173,124 @@ public class DevModeOperations {
 
         Process process = builder.start();
         process.waitFor();
+    }
+
+    /**
+     * Returns the list of log files for the given project and log type.
+     *
+     * @param iProject The project to look up.
+     * @param logType  One of the {@code LOG_TYPE_*} constants defined on this class.
+     * @return Sorted list of {@link Path} objects (may be empty but never null).
+     */
+    public List<Path> getServerLogFiles(IProject iProject, String logType) {
+        if (iProject == null) {
+            return Collections.emptyList();
+        }
+        String projectName = iProject.getName();
+        Project project = projectModel.getProject(projectName);
+        if (project == null) {
+            return Collections.emptyList();
+        }
+        String projectPath = project.getPath();
+        if (projectPath == null) {
+            return Collections.emptyList();
+        }
+        Path logsDir = resolveServerLogsDir(project, projectPath, "defaultServer");
+        if (logsDir == null || !logsDir.toFile().isDirectory()) {
+            return Collections.emptyList();
+        }
+        try {
+            switch (logType) {
+                case LOG_TYPE_MESSAGES:
+                    return listLogFiles(logsDir, "messages");
+                case LOG_TYPE_TRACE:
+                    return listLogFiles(logsDir, "trace");
+                case LOG_TYPE_FFDC:
+                    Path ffdcDir = logsDir.resolve("ffdc");
+                    if (ffdcDir.toFile().isDirectory()) {
+                        return listAllLogFiles(ffdcDir);
+                    }
+                    return Collections.emptyList();
+                default:
+                    return Collections.emptyList();
+            }
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error listing server log files for project " + projectName, e);
+            }
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Opens the given log file in the system's default text editor.
+     *
+     * @param logFile Path to the log file to open.
+     */
+    public void openServerLogFile(Path logFile) {
+        if (logFile == null || !logFile.toFile().exists()) {
+            ErrorHandler.processErrorMessage("Log file not found: " + (logFile != null ? logFile.toString() : "null"), true);
+            return;
+        }
+        Display.getDefault().asyncExec(() -> {
+            try {
+                Desktop.getDesktop().open(logFile.toFile());
+            } catch (Exception e) {
+                if (Trace.isEnabled()) {
+                    Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error opening log file " + logFile, e);
+                }
+                ErrorHandler.processErrorMessage("Unable to open log file: " + logFile.getFileName().toString(), e, true);
+            }
+        });
+    }
+
+    /**
+     * Resolves the Liberty server {@code logs} directory for a project.
+     */
+    private static Path resolveServerLogsDir(Project project, String projectPath, String serverName) {
+        Path base;
+        if (project.getBuildType() == Project.BuildType.MAVEN) {
+            base = Paths.get(projectPath, "target", "liberty", "wlp", "usr", "servers");
+        } else {
+            base = Paths.get(projectPath, "build", "wlp", "usr", "servers");
+        }
+        Path defaultLogs = base.resolve(serverName).resolve("logs");
+        if (defaultLogs.toFile().isDirectory()) {
+            return defaultLogs;
+        }
+        File serversDir = base.toFile();
+        if (serversDir.isDirectory()) {
+            File[] children = serversDir.listFiles(File::isDirectory);
+            if (children != null) {
+                for (File child : children) {
+                    File logsCandidate = new File(child, "logs");
+                    if (logsCandidate.isDirectory()) {
+                        return logsCandidate.toPath();
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** Returns log files whose name starts with the given prefix, sorted by name. */
+    private static List<Path> listLogFiles(Path dir, String prefix) throws IOException {
+        try (Stream<Path> stream = Files.list(dir)) {
+            return stream
+                    .filter(p -> p.getFileName().toString().startsWith(prefix) && p.getFileName().toString().endsWith(".log"))
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
+    }
+
+    /** Returns all files inside dir (non-recursive), sorted by name. */
+    private static List<Path> listAllLogFiles(Path dir) throws IOException {
+        try (Stream<Path> stream = Files.list(dir)) {
+            return stream
+                    .filter(p -> p.toFile().isFile())
+                    .sorted()
+                    .collect(Collectors.toList());
+        }
     }
 
 }

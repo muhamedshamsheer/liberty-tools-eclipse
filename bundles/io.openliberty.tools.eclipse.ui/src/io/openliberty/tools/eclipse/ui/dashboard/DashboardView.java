@@ -13,22 +13,28 @@
 package io.openliberty.tools.eclipse.ui.dashboard;
 
 import java.net.URL;
+import java.nio.file.Path;
 import java.util.List;
 
 import org.eclipse.core.resources.IProject;
 import org.eclipse.debug.core.ILaunchManager;
 import org.eclipse.jface.action.Action;
+import org.eclipse.jface.action.IMenuCreator;
 import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.IToolBarManager;
 import org.eclipse.jface.action.MenuManager;
+import org.eclipse.jface.action.Separator;
 import org.eclipse.jface.commands.ActionHandler;
 import org.eclipse.jface.resource.ImageDescriptor;
 import org.eclipse.jface.viewers.ArrayContentProvider;
+import org.eclipse.jface.viewers.ISelectionChangedListener;
+import org.eclipse.jface.viewers.SelectionChangedEvent;
 import org.eclipse.jface.viewers.TableViewer;
 import org.eclipse.osgi.util.NLS;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.widgets.Composite;
+import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Menu;
 import org.eclipse.swt.widgets.Table;
 import org.eclipse.ui.contexts.IContextService;
@@ -62,6 +68,9 @@ public class DashboardView extends ViewPart {
     /** Liberty logo path. */
     public static final String LIBERTY_LOGO_PATH = "icons/openLibertyLogo.png";
 
+    /** Server logs icon path. */
+    public static final String SERVER_LOGS_IMG_PATH = "icons/serverLogs.png";
+
     /** Maven image tag path. */
     public static final String MAVEN_IMG_TAG_PATH = "icons/mavenTag.png";
 
@@ -82,6 +91,10 @@ public class DashboardView extends ViewPart {
     public static final String APP_MENU_ACTION_VIEW_MVN_IT_REPORT = Messages.getMessage("dashboard_action_view_mvn_it_report");
     public static final String APP_MENU_ACTION_VIEW_MVN_UT_REPORT = Messages.getMessage("dashboard_action_view_mvn_ut_report");
     public static final String APP_MENU_ACTION_VIEW_GRADLE_TEST_REPORT = Messages.getMessage("dashboard_action_view_gradle_test_report");
+    public static final String APP_MENU_ACTION_OPEN_SERVER_LOGS = Messages.getMessage("dashboard_action_open_server_logs");
+    public static final String APP_MENU_ACTION_OPEN_MESSAGE_LOGS = Messages.getMessage("dashboard_action_open_message_logs");
+    public static final String APP_MENU_ACTION_OPEN_TRACE_LOGS = Messages.getMessage("dashboard_action_open_trace_logs");
+    public static final String APP_MENU_ACTION_OPEN_FFDC_LOGS = Messages.getMessage("dashboard_action_open_ffdc_logs");
     public static final String DASHBORD_TOOLBAR_ACTION_REFRESH = Messages.getMessage("dashboard_toolbar_refresh");
 
     /**
@@ -98,6 +111,7 @@ public class DashboardView extends ViewPart {
     private Action viewMavenITestReportsAction;
     private Action viewMavenUTestReportsAction;
     private Action viewGradleTestReportsAction;
+    private Action openServerLogsAction;
     private Action refreshAction;
 
     /**
@@ -133,6 +147,15 @@ public class DashboardView extends ViewPart {
         createContextMenu();
         addToolbarActions();
         getSite().setSelectionProvider(viewer);
+
+        // Enable/disable the server logs button based on whether a project is selected.
+        viewer.addSelectionChangedListener(new ISelectionChangedListener() {
+            @Override
+            public void selectionChanged(SelectionChangedEvent event) {
+                openServerLogsAction.setEnabled(!event.getSelection().isEmpty());
+                getViewSite().getActionBars().updateActionBars();
+            }
+        });
     }
 
     /**
@@ -178,6 +201,7 @@ public class DashboardView extends ViewPart {
      */
     private void addToolbarActions() {
         IToolBarManager tbMgr = getViewSite().getActionBars().getToolBarManager();
+        tbMgr.add(openServerLogsAction);
         tbMgr.add(refreshAction);
     }
 
@@ -214,7 +238,60 @@ public class DashboardView extends ViewPart {
                 ErrorHandler.processErrorMessage(Messages.getMessage("project_not_gradle_or_maven", projectName), true);
                 return;
             }
+
         }
+    }
+
+    /**
+     * Builds the "Open server logs" cascading sub-menu.
+     * Structure: Open server logs > Message logs > [files...]
+     *                              > Trace logs  > [files...]
+     *                              > FFDC logs   > [files...]
+     *
+     * @param iProject The selected project.
+     * @return A populated {@link MenuManager} ready to be added to the parent menu.
+     */
+    private IMenuManager buildServerLogsSubMenu(IProject iProject) {
+        MenuManager logsMenu = new MenuManager(APP_MENU_ACTION_OPEN_SERVER_LOGS);
+
+        logsMenu.add(buildLogTypeSubMenu(iProject, APP_MENU_ACTION_OPEN_MESSAGE_LOGS, DevModeOperations.LOG_TYPE_MESSAGES));
+        logsMenu.add(buildLogTypeSubMenu(iProject, APP_MENU_ACTION_OPEN_TRACE_LOGS, DevModeOperations.LOG_TYPE_TRACE));
+        logsMenu.add(buildLogTypeSubMenu(iProject, APP_MENU_ACTION_OPEN_FFDC_LOGS, DevModeOperations.LOG_TYPE_FFDC));
+
+        return logsMenu;
+    }
+
+    /**
+     * Builds a sub-menu for one log type (e.g. "Message logs").
+     * Each file found on disk becomes a clickable action that opens the file.
+     * If no files exist, a single disabled placeholder is shown.
+     */
+    private IMenuManager buildLogTypeSubMenu(IProject iProject, String label, String logType) {
+        MenuManager typeMenu = new MenuManager(label);
+
+        List<Path> logFiles = devModeOps.getServerLogFiles(iProject, logType);
+
+        if (logFiles.isEmpty()) {
+            Action placeholder = new Action(Messages.getMessage("dashboard_toolbar_no_logs_found")) {
+                @Override
+                public void run() { /* no-op */ }
+            };
+            placeholder.setEnabled(false);
+            typeMenu.add(placeholder);
+        } else {
+            for (Path logFile : logFiles) {
+                String fileName = logFile.getFileName().toString();
+                Action openAction = new Action(fileName) {
+                    @Override
+                    public void run() {
+                        devModeOps.openServerLogFile(logFile);
+                    }
+                };
+                typeMenu.add(openAction);
+            }
+        }
+
+        return typeMenu;
     }
 
     /**
@@ -223,12 +300,14 @@ public class DashboardView extends ViewPart {
     private void createActions() {
         ImageDescriptor ActionImg = null;
         ImageDescriptor refreshImg = null;
+        ImageDescriptor serverLogsImg = null;
 
         // Get the image descriptors for the menu actions and toolbar.
         // If there is a failure, display the error and proceed without the icons.
         try {
             ActionImg = ImageDescriptor.createFromURL(new URL("platform:/plugin/org.eclipse.jdt.debug.ui/icons/full/elcl16/thread_view.gif"));
             refreshImg = ImageDescriptor.createFromURL(new URL("platform:/plugin/org.eclipse.ui.browser/icons/clcl16/nav_refresh.png"));
+            serverLogsImg = ImageDescriptor.createFromURL(new URL("platform:/plugin/io.openliberty.tools.eclipse.ui/" + SERVER_LOGS_IMG_PATH));
         } catch (Exception e) {
             String msg = "An error was detected while retrieving image descriptions.";
             if (Trace.isEnabled()) {
@@ -481,6 +560,39 @@ public class DashboardView extends ViewPart {
         viewGradleTestReportsAction.setActionDefinitionId("io.openliberty.tools.eclipse.project.viewGradleTestReport.command");
         ActionHandler gradleTestReportsHandler = new ActionHandler(viewGradleTestReportsAction);
         handlerService.activateHandler(viewGradleTestReportsAction.getActionDefinitionId(), gradleTestReportsHandler);
+
+        openServerLogsAction = new Action(APP_MENU_ACTION_OPEN_SERVER_LOGS, Action.AS_DROP_DOWN_MENU) {
+            @Override
+            public void run() {
+                // icon click — delegate to the IMenuCreator same as arrow click
+                Menu menu = getMenuCreator().getMenu(viewer.getControl());
+                if (menu != null && !menu.isDisposed()) {
+                    menu.setVisible(true);
+                }
+            }
+        };
+        openServerLogsAction.setImageDescriptor(serverLogsImg);
+        openServerLogsAction.setEnabled(false);
+        openServerLogsAction.setMenuCreator(new IMenuCreator() {
+            private Menu menu;
+            @Override
+            public Menu getMenu(Control parent) {
+                dispose();
+                IProject iProject = devModeOps.getSelectedDashboardProject();
+                if (iProject == null) return null;
+                MenuManager mgr = (MenuManager) buildServerLogsSubMenu(iProject);
+                menu = mgr.createContextMenu(parent);
+                mgr.update(true);
+                return menu;
+            }
+            @Override
+            public Menu getMenu(Menu parent) { return getMenu(viewer.getControl()); }
+            @Override
+            public void dispose() {
+                if (menu != null && !menu.isDisposed()) menu.dispose();
+                menu = null;
+            }
+        });
 
         // Toolbar: Refresh the project list.
         refreshAction = new Action(DASHBORD_TOOLBAR_ACTION_REFRESH) {
