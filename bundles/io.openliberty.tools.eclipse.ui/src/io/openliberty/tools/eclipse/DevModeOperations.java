@@ -12,7 +12,6 @@
 *******************************************************************************/
 package io.openliberty.tools.eclipse;
 
-import java.awt.Desktop;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
@@ -31,6 +30,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import org.eclipse.core.filesystem.EFS;
+import org.eclipse.core.filesystem.IFileStore;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
@@ -49,10 +50,12 @@ import org.eclipse.jface.viewers.IStructuredSelection;
 import org.eclipse.osgi.util.NLS;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.ISelectionService;
+import org.eclipse.ui.IWorkbenchPage;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.browser.IWebBrowser;
 import org.eclipse.ui.browser.IWorkbenchBrowserSupport;
+import org.eclipse.ui.ide.IDE;
 
 import io.openliberty.tools.eclipse.CommandBuilder.CommandNotFoundException;
 import io.openliberty.tools.eclipse.Project.BuildType;
@@ -1223,7 +1226,7 @@ public class DevModeOperations {
     }
 
     /**
-     * Opens the given log file in the system's default text editor.
+     * Opens the given log file in the Eclipse internal text editor.
      *
      * @param logFile Path to the log file to open.
      */
@@ -1234,7 +1237,16 @@ public class DevModeOperations {
         }
         Display.getDefault().asyncExec(() -> {
             try {
-                Desktop.getDesktop().open(logFile.toFile());
+                IWorkbenchWindow window = PlatformUI.getWorkbench().getActiveWorkbenchWindow();
+                if (window == null) {
+                    return;
+                }
+                IWorkbenchPage page = window.getActivePage();
+                if (page == null) {
+                    return;
+                }
+                IFileStore fileStore = EFS.getLocalFileSystem().getStore(logFile.toUri());
+                IDE.openEditorOnFileStore(page, fileStore);
             } catch (Exception e) {
                 if (Trace.isEnabled()) {
                     Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error opening log file " + logFile, e);
