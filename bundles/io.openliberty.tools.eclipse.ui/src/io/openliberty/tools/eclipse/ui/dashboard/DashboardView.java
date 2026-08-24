@@ -239,6 +239,8 @@ public class DashboardView extends ViewPart {
                 return;
             }
 
+            mgr.add(new Separator());
+            mgr.add(buildServerLogsSubMenu(iProject));
         }
     }
 
