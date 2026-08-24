@@ -367,10 +367,33 @@
                                   <test forcePluginActivation="true" property="org.eclipse.debug.ui.projectNature" value="io.openliberty.tools.eclipse.ui.libertyNature"/>
                               </not>
                           </and>
-
                     </iterate>
                 </visibleWhen>
             </command>
+        </menuContribution>
+
+        <!-- Project Explorer right-click: Liberty → Open server logs → [type] → [file] -->
+        <menuContribution
+            locationURI="popup:org.eclipse.ui.navigator.ProjectExplorer#PopupMenu?after=additions">
+            <menu
+                id="io.openliberty.tools.eclipse.explorer.liberty.menu"
+                label="Liberty"
+                icon="icons/openLibertyLogo.png">
+                <visibleWhen checkEnabled="false">
+                    <iterate operator="or" ifEmpty="false">
+                        <and>
+                            <instanceof value="org.eclipse.core.runtime.IAdaptable"/>
+                            <test forcePluginActivation="true"
+                                  property="org.eclipse.debug.ui.projectNature"
+                                  value="io.openliberty.tools.eclipse.ui.libertyNature"/>
+                        </and>
+                    </iterate>
+                </visibleWhen>
+                <dynamic
+                    id="io.openliberty.tools.eclipse.explorer.liberty.openserverlogs.dynamic"
+                    class="io.openliberty.tools.eclipse.handlers.OpenServerLogsContribution">
+                </dynamic>
+            </menu>
         </menuContribution>
    </extension>
    

@@ -580,9 +580,13 @@ public class DashboardView extends ViewPart {
                 dispose();
                 IProject iProject = devModeOps.getSelectedDashboardProject();
                 if (iProject == null) return null;
-                MenuManager mgr = (MenuManager) buildServerLogsSubMenu(iProject);
-                menu = mgr.createContextMenu(parent);
-                mgr.update(true);
+                // Root manager materialises as the popup. The "Open server logs"
+                // sub-menu is added as a child so it appears as a labelled entry
+                // with Message / Trace / FFDC nested under it.
+                MenuManager root = new MenuManager();
+                root.add(buildServerLogsSubMenu(iProject));
+                menu = root.createContextMenu(parent);
+                root.update(true);
                 return menu;
             }
             @Override
