@@ -23,11 +23,19 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+
+import org.eclipse.core.filesystem.EFS;
+import org.eclipse.core.filesystem.IFileStore;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
@@ -48,10 +56,15 @@ import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.swt.widgets.Shell;
 import org.eclipse.ui.ISelectionService;
+import org.eclipse.ui.IWorkbenchPage;
 import org.eclipse.ui.IWorkbenchWindow;
 import org.eclipse.ui.PlatformUI;
 import org.eclipse.ui.browser.IWebBrowser;
 import org.eclipse.ui.browser.IWorkbenchBrowserSupport;
+import org.eclipse.ui.ide.IDE;
+
+import org.w3c.dom.Document;
+import org.w3c.dom.NodeList;
 
 import io.openliberty.tools.eclipse.CommandBuilder.CommandData;
 import io.openliberty.tools.eclipse.CommandBuilder.CommandNotFoundException;
@@ -1772,4 +1785,119 @@ public class DevModeOperations {
             return ProjectAggregatedState.MIXED;
         }
     }
+
+    /**
+     *
+     * @param iProject The project to look up.
+     * @return A map of group name to sorted list of paths. Never null; empty if no logs directory is found.
+     */
+    public Map<String, List<Path>> getAllServerLogFiles(IProject iProject) {
+        Map<String, List<Path>> result = new LinkedHashMap<>();
+        if (iProject == null) {
+            return result;
+        }
+        ProjectModel projectModel = workspaceModel.getProjectByName(iProject.getName());
+        if (projectModel == null) {
+            return result;
+        }
+        Path logsDir = resolveServerLogsDir(projectModel);
+        if (logsDir == null) {
+            return result;
+        }
+        try {
+            File[] entries = logsDir.toFile().listFiles();
+            if (entries != null) {
+                // Sort entries by name so group order is stable across platforms and runs.
+                Arrays.sort(entries, Comparator.comparing(File::getName));
+                for (File entry : entries) {
+                    if (entry.isFile() && entry.getName().endsWith(".log")) {
+                        // Group key: strip extension, then take up to the first '_'.
+                        // "messages.log" and "messages_26.09.log" both → "messages".
+                        String stem = entry.getName().substring(0, entry.getName().lastIndexOf('.'));
+                        int us = stem.indexOf('_');
+                        String group = (us > 0) ? stem.substring(0, us) : stem;
+                        result.computeIfAbsent(group, k -> new ArrayList<>()).add(entry.toPath());
+                    } else if (entry.isDirectory()) {
+                        // Only include a sub-directory if it contains at least one .log file.
+                        File[] subFiles = entry.listFiles(f -> f.isFile() && f.getName().endsWith(".log"));
+                        if (subFiles != null && subFiles.length > 0) {
+                            List<Path> list = result.computeIfAbsent(entry.getName(), k -> new ArrayList<>());
+                            for (File f : subFiles) {
+                                list.add(f.toPath());
+                            }
+                        }
+                    }
+                }
+            }
+            result.values().forEach(Collections::sort);
+        } catch (Exception e) {
+            Logger.logWarning("Error listing server log files for project " + iProject.getName(), e);
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_TOOLS,
+                        "Error listing server log files for project " + iProject.getName(), e);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Opens the given log file using whatever editor Eclipse has configured for the file type.
+     * Any failure is reported to the user via an error dialog.
+     *
+     * @param logFile Path to the log file to open.
+     */
+    public void openServerLogFile(Path logFile) {
+        Display.getDefault().asyncExec(() -> {
+            try {
+                if (logFile == null || !logFile.toFile().exists()) {
+                    ErrorHandler.processErrorMessage(Messages.getMessage("log_file_not_found",
+                            logFile != null ? logFile.toString() : "null"), true);
+                    return;
+                }
+                IWorkbenchPage page = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getActivePage();
+                IFileStore fileStore = EFS.getLocalFileSystem().getStore(logFile.toUri());
+                IDE.openEditorOnFileStore(page, fileStore);
+            } catch (Exception e) {
+                if (Trace.isEnabled()) {
+                    Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error opening log file " + logFile, e);
+                }
+                ErrorHandler.processErrorMessage(Messages.getMessage("log_file_open_error",
+                        logFile != null ? logFile.getFileName().toString() : "null"), e, true);
+            }
+        });
+    }
+
+    /**
+     * Returns the server logs directory for the given project by reading the serverDirectory element
+     * from liberty-plugin-config.xml. Returns null if the file is absent or the directory does not exist.
+     *
+     * @param projectModel The project model used to locate liberty-plugin-config.xml.
+     * @return The logs directory path, or null if it cannot be resolved.
+     */
+    private Path resolveServerLogsDir(ProjectModel projectModel) {
+        try {
+            Path configXmlPath = getLibertyPluginConfigXmlPath(projectModel);
+            if (configXmlPath == null || !configXmlPath.toFile().exists()) {
+                return null;
+            }
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            DocumentBuilder db = dbf.newDocumentBuilder();
+            Document doc = db.parse(configXmlPath.toFile());
+            doc.getDocumentElement().normalize();
+            NodeList list = doc.getElementsByTagName("serverDirectory");
+            if (list.getLength() == 0) {
+                return null;
+            }
+            Path logsDir = Paths.get(list.item(0).getTextContent(), "logs");
+            return logsDir.toFile().isDirectory() ? logsDir : null;
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_TOOLS,
+                        "Could not resolve server logs directory from liberty-plugin-config.xml", e);
+            }
+            return null;
+        }
+    }
+
 }

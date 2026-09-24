@@ -13,10 +13,12 @@
 package io.openliberty.tools.eclipse.ui.dashboard;
 
 import java.net.URI;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import org.eclipse.core.resources.IProject;
@@ -26,6 +28,7 @@ import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.IToolBarManager;
 import org.eclipse.jface.action.MenuManager;
+import org.eclipse.jface.action.Separator;
 import org.eclipse.jface.commands.ActionHandler;
 import org.eclipse.jface.resource.ImageDescriptor;
 import org.eclipse.jface.viewers.TreeViewer;
@@ -101,6 +104,8 @@ public class DashboardView extends ViewPart {
     public static final String APP_MENU_ACTION_VIEW_MVN_IT_REPORT = Messages.getMessage("dashboard_action_view_mvn_it_report");
     public static final String APP_MENU_ACTION_VIEW_MVN_UT_REPORT = Messages.getMessage("dashboard_action_view_mvn_ut_report");
     public static final String APP_MENU_ACTION_VIEW_GRADLE_TEST_REPORT = Messages.getMessage("dashboard_action_view_gradle_test_report");
+    public static final String APP_MENU_ACTION_SERVER = Messages.getMessage("dashboard_action_server");
+    public static final String APP_MENU_ACTION_OPEN_LOGS = Messages.getMessage("dashboard_action_open_logs");
     public static final String DASHBOARD_TOOLBAR_REFRESH = Messages.getMessage("dashboard_toolbar_refresh");
     public static final String DASHBOARD_TOOLBAR_EXPAND_ALL = Messages.getMessage("dashboard_toolbar_expand_all");
     public static final String DASHBOARD_TOOLBAR_COLLAPSE_ALL = Messages.getMessage("dashboard_toolbar_collapse_all");
@@ -542,7 +547,66 @@ public class DashboardView extends ViewPart {
                 ErrorHandler.processErrorMessage(Messages.getMessage("project_not_gradle_or_maven", projectName), true);
                 return;
             }
+
+            mgr.add(new Separator());
+            mgr.add(buildServerMenu(iProject));
         }
+    }
+
+    /**
+     * Builds the Server cascading menu for the given project.
+     */
+    private MenuManager buildServerMenu(IProject iProject) {
+        MenuManager serverMenu = new MenuManager(APP_MENU_ACTION_SERVER);
+        serverMenu.add(buildOpenLogsMenu(iProject));
+        return serverMenu;
+    }
+
+    /** Maximum number of file entries shown per log-type group before a "More..." item is added. */
+    private static final int LOG_FILES_VISIBLE_LIMIT = 10;
+
+    /**
+     * Builds the "Open Logs" sub-menu for the given project.
+     * <ul>
+     *   <li>If no log files exist the menu is grayed out (disabled).</li>
+     *   <li>Each log-type group shows up to {@value #LOG_FILES_VISIBLE_LIMIT} entries.
+     *       When there are more, a disabled "+N more..." item is appended.</li>
+     * </ul>
+     */
+    private MenuManager buildOpenLogsMenu(IProject iProject) {
+        MenuManager openLogsMenu = new MenuManager(APP_MENU_ACTION_OPEN_LOGS);
+        Map<String, List<Path>> allLogs = devModeOps.getAllServerLogFiles(iProject);
+
+        if (allLogs.isEmpty()) {
+            openLogsMenu.setEnabled(false);
+        } else {
+            for (Map.Entry<String, List<Path>> entry : allLogs.entrySet()) {
+                MenuManager typeMenu = new MenuManager(entry.getKey());
+                List<Path> logFiles = entry.getValue();
+                int total = logFiles.size();
+                int visible = Math.min(total, LOG_FILES_VISIBLE_LIMIT);
+                for (int i = 0; i < visible; i++) {
+                    Path logFile = logFiles.get(i);
+                    Action openAction = new Action(logFile.getFileName().toString()) {
+                        @Override
+                        public void run() {
+                            devModeOps.openServerLogFile(logFile);
+                        }
+                    };
+                    typeMenu.add(openAction);
+                }
+                if (total > LOG_FILES_VISIBLE_LIMIT) {
+                    Action more = new Action(Messages.getMessage("dashboard_action_logs_more",
+                            total - LOG_FILES_VISIBLE_LIMIT)) {
+                        @Override public void run() { /* informational only */ }
+                    };
+                    more.setEnabled(false);
+                    typeMenu.add(more);
+                }
+                openLogsMenu.add(typeMenu);
+            }
+        }
+        return openLogsMenu;
     }
 
     /**
