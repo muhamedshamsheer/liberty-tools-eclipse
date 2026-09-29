@@ -64,6 +64,7 @@ import org.eclipse.ui.browser.IWorkbenchBrowserSupport;
 import org.eclipse.ui.ide.IDE;
 
 import org.w3c.dom.Document;
+import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
 import io.openliberty.tools.eclipse.CommandBuilder.CommandData;
@@ -1793,48 +1794,36 @@ public class DevModeOperations {
      */
     public Map<String, List<Path>> getAllServerLogFiles(IProject iProject) {
         Map<String, List<Path>> result = new LinkedHashMap<>();
-        if (iProject == null) {
-            return result;
-        }
-        ProjectModel projectModel = workspaceModel.getProjectByName(iProject.getName());
-        if (projectModel == null) {
-            return result;
-        }
-        Path logsDir = resolveServerLogsDir(projectModel);
+        ProjectModel projectModel = iProject == null ? null : workspaceModel.getProjectByName(iProject.getName());
+        Path logsDir = projectModel == null ? null : resolveServerLogsDir(projectModel);
         if (logsDir == null) {
             return result;
         }
         try {
+            Map<String, String> stemToGroup = readConfiguredLogStems(logsDir.getParent());
             File[] entries = logsDir.toFile().listFiles();
-            if (entries != null) {
-                // Sort entries by name so group order is stable across platforms and runs.
-                Arrays.sort(entries, Comparator.comparing(File::getName));
-                for (File entry : entries) {
-                    if (entry.isFile() && entry.getName().endsWith(".log")) {
-                        // Group key: strip extension, then take up to the first '_'.
-                        // "messages.log" and "messages_26.09.log" both → "messages".
-                        String stem = entry.getName().substring(0, entry.getName().lastIndexOf('.'));
-                        int us = stem.indexOf('_');
-                        String group = (us > 0) ? stem.substring(0, us) : stem;
-                        result.computeIfAbsent(group, k -> new ArrayList<>()).add(entry.toPath());
-                    } else if (entry.isDirectory()) {
-                        // Only include a sub-directory if it contains at least one .log file.
-                        File[] subFiles = entry.listFiles(f -> f.isFile() && f.getName().endsWith(".log"));
-                        if (subFiles != null && subFiles.length > 0) {
-                            List<Path> list = result.computeIfAbsent(entry.getName(), k -> new ArrayList<>());
-                            for (File f : subFiles) {
-                                list.add(f.toPath());
-                            }
-                        }
+            if (entries == null) {
+                return result;
+            }
+            Arrays.sort(entries, Comparator.comparing(File::getName));
+            for (File entry : entries) {
+                if (entry.isFile() && entry.getName().endsWith(".log")) {
+                    String stem = entry.getName().replaceAll("\\.[^.]+$", "");
+                    result.computeIfAbsent(resolveGroup(stem, stemToGroup), k -> new ArrayList<>()).add(entry.toPath());
+                } else if (entry.isDirectory()) {
+                    File[] sub = entry.listFiles(f -> f.isFile() && f.getName().endsWith(".log"));
+                    if (sub != null && sub.length > 0) {
+                        List<Path> list = result.computeIfAbsent(entry.getName(), k -> new ArrayList<>());
+                        for (File f : sub) list.add(f.toPath());
                     }
                 }
             }
-            result.values().forEach(Collections::sort);
+            result.values().forEach(files -> files.sort(
+                    Comparator.comparingLong((Path p) -> p.toFile().lastModified()).reversed()));
         } catch (Exception e) {
             Logger.logWarning("Error listing server log files for project " + iProject.getName(), e);
             if (Trace.isEnabled()) {
-                Trace.getTracer().trace(Trace.TRACE_TOOLS,
-                        "Error listing server log files for project " + iProject.getName(), e);
+                Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error listing server log files", e);
             }
         }
         return result;
@@ -1846,17 +1835,66 @@ public class DevModeOperations {
      *
      * @param logFile Path to the log file to open.
      */
+    private static Map<String, String> readConfiguredLogStems(Path serverDir) {
+        Map<String, String> map = new LinkedHashMap<>();
+        if (serverDir == null) return map;
+        File serverXml = serverDir.resolve("server.xml").toFile();
+        if (!serverXml.exists()) return map;
+        try {
+            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
+            Document doc = dbf.newDocumentBuilder().parse(serverXml);
+            doc.getDocumentElement().normalize();
+            NodeList logging = doc.getElementsByTagName("logging");
+            for (int i = 0; i < logging.getLength(); i++) {
+                Element el = (Element) logging.item(i);
+                putStem(map, el.getAttribute("messageFileName"), "messages");
+                putStem(map, el.getAttribute("traceFileName"),   "trace");
+            }
+            NodeList access = doc.getElementsByTagName("accessLogging");
+            for (int i = 0; i < access.getLength(); i++) {
+                putStem(map, ((Element) access.item(i)).getAttribute("filepath"), "access");
+            }
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_TOOLS, "Could not parse server.xml; using default log grouping", e);
+            }
+        }
+        return map;
+    }
+
+    /** Extracts the filename stem from a path attribute value and maps it to a group. */
+    private static void putStem(Map<String, String> map, String attr, String group) {
+        if (attr == null || attr.isEmpty()) return;
+        String name = attr.replace('\\', '/');
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) name = name.substring(slash + 1);
+        int dot = name.lastIndexOf('.');
+        if (dot > 0) name = name.substring(0, dot);
+        if (!name.isEmpty()) map.put(name, group);
+    }
+
+    /** Maps a log file stem to its group using config, rolled-file suffix stripping, then underscore split. */
+    private static String resolveGroup(String stem, Map<String, String> stemToGroup) {
+        if (stemToGroup.containsKey(stem)) return stemToGroup.get(stem);
+        // Strip Liberty timestamp suffix e.g. "messages_26.09.21_13.11.36.0" → "messages"
+        String base = stem.replaceAll("(_\\d[\\d.]*)+$", "");
+        if (!base.equals(stem) && stemToGroup.containsKey(base)) return stemToGroup.get(base);
+        int us = stem.indexOf('_');
+        return us > 0 ? stem.substring(0, us) : stem;
+    }
+
+    /** Opens a log file in the Eclipse editor, reporting any failure to the user. */
     public void openServerLogFile(Path logFile) {
         Display.getDefault().asyncExec(() -> {
             try {
                 if (logFile == null || !logFile.toFile().exists()) {
-                    ErrorHandler.processErrorMessage(Messages.getMessage("log_file_not_found",
-                            logFile != null ? logFile.toString() : "null"), true);
+                    ErrorHandler.processErrorMessage(
+                            Messages.getMessage("log_file_not_found", logFile != null ? logFile.toString() : "null"), true);
                     return;
                 }
                 IWorkbenchPage page = PlatformUI.getWorkbench().getActiveWorkbenchWindow().getActivePage();
-                IFileStore fileStore = EFS.getLocalFileSystem().getStore(logFile.toUri());
-                IDE.openEditorOnFileStore(page, fileStore);
+                IDE.openEditorOnFileStore(page, EFS.getLocalFileSystem().getStore(logFile.toUri()));
             } catch (Exception e) {
                 if (Trace.isEnabled()) {
                     Trace.getTracer().trace(Trace.TRACE_TOOLS, "Error opening log file " + logFile, e);
@@ -1876,25 +1914,19 @@ public class DevModeOperations {
      */
     private Path resolveServerLogsDir(ProjectModel projectModel) {
         try {
-            Path configXmlPath = getLibertyPluginConfigXmlPath(projectModel);
-            if (configXmlPath == null || !configXmlPath.toFile().exists()) {
-                return null;
-            }
+            Path configXml = getLibertyPluginConfigXmlPath(projectModel);
+            if (configXml == null || !configXml.toFile().exists()) return null;
             DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
             dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            DocumentBuilder db = dbf.newDocumentBuilder();
-            Document doc = db.parse(configXmlPath.toFile());
+            Document doc = dbf.newDocumentBuilder().parse(configXml.toFile());
             doc.getDocumentElement().normalize();
             NodeList list = doc.getElementsByTagName("serverDirectory");
-            if (list.getLength() == 0) {
-                return null;
-            }
+            if (list.getLength() == 0) return null;
             Path logsDir = Paths.get(list.item(0).getTextContent(), "logs");
             return logsDir.toFile().isDirectory() ? logsDir : null;
         } catch (Exception e) {
             if (Trace.isEnabled()) {
-                Trace.getTracer().trace(Trace.TRACE_TOOLS,
-                        "Could not resolve server logs directory from liberty-plugin-config.xml", e);
+                Trace.getTracer().trace(Trace.TRACE_TOOLS, "Could not resolve server logs directory", e);
             }
             return null;
         }

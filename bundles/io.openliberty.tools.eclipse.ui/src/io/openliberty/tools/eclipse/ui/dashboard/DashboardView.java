@@ -24,6 +24,8 @@ import java.util.Set;
 import org.eclipse.core.resources.IProject;
 import org.eclipse.debug.core.ILaunchManager;
 import org.eclipse.jface.action.Action;
+import org.eclipse.jface.action.ActionContributionItem;
+import org.eclipse.jface.action.IContributionItem;
 import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.IToolBarManager;
@@ -127,6 +129,9 @@ public class DashboardView extends ViewPart {
     private Action filterAction;
     private Action expandAllAction;
     private Action collapseAllAction;
+
+    /** Shared image descriptor used for all menu actions. */
+    private ImageDescriptor ActionImg;
 
     /** Tree viewer that holds the entries in the dashboard. */
     TreeViewer viewer;
@@ -558,53 +563,62 @@ public class DashboardView extends ViewPart {
      */
     private MenuManager buildServerMenu(IProject iProject) {
         MenuManager serverMenu = new MenuManager(APP_MENU_ACTION_SERVER);
+        serverMenu.setImageDescriptor(ActionImg);
         serverMenu.add(buildOpenLogsMenu(iProject));
         return serverMenu;
     }
 
-    /** Maximum number of file entries shown per log-type group before a "More..." item is added. */
+    /** Max log files shown per group; a "More..." entry is added when exceeded. */
     private static final int LOG_FILES_VISIBLE_LIMIT = 10;
 
     /**
-     * Builds the "Open Logs" sub-menu for the given project.
-     * <ul>
-     *   <li>If no log files exist the menu is grayed out (disabled).</li>
-     *   <li>Each log-type group shows up to {@value #LOG_FILES_VISIBLE_LIMIT} entries.
-     *       When there are more, a disabled "+N more..." item is appended.</li>
-     * </ul>
+     * Builds the "Open Logs" sub-menu. Returns a disabled item when no logs exist,
+     * otherwise a cascading menu grouped by log type with up to {@value #LOG_FILES_VISIBLE_LIMIT}
+     * files per group and a "More..." entry that opens the directory in the OS file manager.
      */
-    private MenuManager buildOpenLogsMenu(IProject iProject) {
-        MenuManager openLogsMenu = new MenuManager(APP_MENU_ACTION_OPEN_LOGS);
+    private IContributionItem buildOpenLogsMenu(IProject iProject) {
         Map<String, List<Path>> allLogs = devModeOps.getAllServerLogFiles(iProject);
 
         if (allLogs.isEmpty()) {
-            openLogsMenu.setEnabled(false);
-        } else {
-            for (Map.Entry<String, List<Path>> entry : allLogs.entrySet()) {
-                MenuManager typeMenu = new MenuManager(entry.getKey());
-                List<Path> logFiles = entry.getValue();
-                int total = logFiles.size();
-                int visible = Math.min(total, LOG_FILES_VISIBLE_LIMIT);
-                for (int i = 0; i < visible; i++) {
-                    Path logFile = logFiles.get(i);
-                    Action openAction = new Action(logFile.getFileName().toString()) {
-                        @Override
-                        public void run() {
-                            devModeOps.openServerLogFile(logFile);
-                        }
-                    };
-                    typeMenu.add(openAction);
-                }
-                if (total > LOG_FILES_VISIBLE_LIMIT) {
-                    Action more = new Action(Messages.getMessage("dashboard_action_logs_more",
-                            total - LOG_FILES_VISIBLE_LIMIT)) {
-                        @Override public void run() { /* informational only */ }
-                    };
-                    more.setEnabled(false);
-                    typeMenu.add(more);
-                }
-                openLogsMenu.add(typeMenu);
+            Action disabled = new Action(APP_MENU_ACTION_OPEN_LOGS) {
+                @Override public void run() { /* no-op */ }
+            };
+            disabled.setEnabled(false);
+            return new ActionContributionItem(disabled);
+        }
+
+        MenuManager openLogsMenu = new MenuManager(APP_MENU_ACTION_OPEN_LOGS);
+        for (Map.Entry<String, List<Path>> entry : allLogs.entrySet()) {
+            MenuManager typeMenu = new MenuManager(entry.getKey());
+            List<Path> logFiles = entry.getValue();
+            int total = logFiles.size();
+            int visible = Math.min(total, LOG_FILES_VISIBLE_LIMIT);
+            for (int i = 0; i < visible; i++) {
+                Path logFile = logFiles.get(i);
+                Action openAction = new Action(logFile.getFileName().toString()) {
+                    @Override
+                    public void run() {
+                        devModeOps.openServerLogFile(logFile);
+                    }
+                };
+                typeMenu.add(openAction);
             }
+            if (total > LOG_FILES_VISIBLE_LIMIT) {
+                Path dir = logFiles.get(0).getParent();
+                Action more = new Action(Messages.getMessage("dashboard_action_logs_more")) {
+                    @Override
+                    public void run() {
+                        try {
+                            java.awt.Desktop.getDesktop().open(dir.toFile());
+                        } catch (Exception e) {
+                            ErrorHandler.processErrorMessage(
+                                Messages.getMessage("log_file_open_error", dir.toString()), e, true);
+                        }
+                    }
+                };
+                typeMenu.add(more);
+            }
+            openLogsMenu.add(typeMenu);
         }
         return openLogsMenu;
     }
@@ -613,7 +627,6 @@ public class DashboardView extends ViewPart {
      * Instantiates menu and toolbar actions.
      */
     private void createActions() {
-        ImageDescriptor ActionImg = null;
         ImageDescriptor refreshImg = null;
 
         // Get the image descriptors for the menu actions and toolbar.
