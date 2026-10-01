@@ -559,7 +559,11 @@ public class DashboardView extends ViewPart {
     }
 
     /**
-     * Builds the Server cascading menu for the given project.
+     * Builds the "Server" cascading top-level menu entry for the given project.
+     *
+     * @param iProject The currently selected dashboard project.
+     *
+     * @return A MenuManager representing the "Server" sub-menu.
      */
     private MenuManager buildServerMenu(IProject iProject) {
         MenuManager serverMenu = new MenuManager(APP_MENU_ACTION_SERVER);
@@ -572,9 +576,14 @@ public class DashboardView extends ViewPart {
     private static final int LOG_FILES_VISIBLE_LIMIT = 10;
 
     /**
-     * Builds the "Open Logs" sub-menu. Returns a disabled item when no logs exist,
-     * otherwise a cascading menu grouped by log type with up to {@value #LOG_FILES_VISIBLE_LIMIT}
-     * files per group and a "More..." entry that opens the directory in the OS file manager.
+     * Builds the "Open Logs" sub-menu for the given project. Returns a single disabled item when
+     * no logs exist, otherwise a cascading menu grouped by log type with up to
+     * {@value #LOG_FILES_VISIBLE_LIMIT} files per group and a "More..." entry that opens the
+     * log directory in the OS file manager when the limit is exceeded.
+     *
+     * @param iProject The currently selected dashboard project.
+     *
+     * @return A contribution item representing the "Open Logs" sub-menu.
      */
     private IContributionItem buildOpenLogsMenu(IProject iProject) {
         Map<String, List<Path>> allLogs = devModeOps.getAllServerLogFiles(iProject);
@@ -608,11 +617,9 @@ public class DashboardView extends ViewPart {
                 Action more = new Action(Messages.getMessage("dashboard_action_logs_more")) {
                     @Override
                     public void run() {
-                        try {
-                            java.awt.Desktop.getDesktop().open(dir.toFile());
-                        } catch (Exception e) {
+                        if (!org.eclipse.swt.program.Program.launch(dir.toString())) {
                             ErrorHandler.processErrorMessage(
-                                Messages.getMessage("log_file_open_error", dir.toString()), e, true);
+                                Messages.getMessage("log_file_open_error", dir.toString()), true);
                         }
                     }
                 };

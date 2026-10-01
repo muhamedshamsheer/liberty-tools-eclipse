@@ -165,6 +165,18 @@ public class DevModeOperations {
     private static final String ANSI_SUPPORT_QUALIFIER = "org.eclipse.ui.console";
     private static final String ANSI_SUPPORT_KEY = "ANSI_support_enabled";
 
+    /**
+     * Shared, secure DocumentBuilderFactory used for all XML parsing in this class.
+     * DocumentBuilderFactory.newInstance() involves a service-loader lookup; hoisting it
+     * to a static field avoids that cost on every right-click / log-directory scan.
+     */
+    private static final DocumentBuilderFactory SECURE_DBF;
+    static {
+        DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
+        try { dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true); } catch (Exception ignored) { }
+        SECURE_DBF = dbf;
+    }
+
     private static final int STOP_TIMEOUT_SECONDS = 60;
     protected static final QualifiedName STOP_JOB_COMPLETION_TIMEOUT = new QualifiedName("io.openliberty.tools.eclipse.ui", "stopJobCompletionTimeout");
     protected static final QualifiedName STOP_JOB_COMPLETION_EXIT_CODE = new QualifiedName("io.openliberty.tools.eclipse.ui", "stopJobCompletionExitCode");
@@ -1788,9 +1800,13 @@ public class DevModeOperations {
     }
 
     /**
+     * Returns all .log files in the server logs directory grouped by log type, sorted newest-first
+     * within each group. Sub-directories (e.g. ffdc/) are each surfaced as their own group.
+     * Returns an empty map when the logs directory cannot be resolved.
      *
-     * @param iProject The project to look up.
-     * @return A map of group name to sorted list of paths. Never null; empty if no logs directory is found.
+     * @param iProject The selected dashboard project.
+     *
+     * @return A map of group name to ordered list of log file paths; never null.
      */
     public Map<String, List<Path>> getAllServerLogFiles(IProject iProject) {
         Map<String, List<Path>> result = new LinkedHashMap<>();
@@ -1799,8 +1815,16 @@ public class DevModeOperations {
         if (logsDir == null) {
             return result;
         }
+        // Ensure the log directory is being monitored for file changes.
+        registerWithMonitor(iProject, logsDir);
         try {
             Map<String, String> stemToGroup = readConfiguredLogStems(logsDir.getParent());
+            // Merge rename hints from the monitor (new stem → original group) so a
+            // file renamed outside of server.xml still appears under its original group.
+            LogDirectoryMonitor monitor = LibertyDevPlugin.getLogDirectoryMonitor();
+            if (monitor != null) {
+                monitor.getRenameHints(iProject.getName()).forEach(stemToGroup::putIfAbsent);
+            }
             File[] entries = logsDir.toFile().listFiles();
             if (entries == null) {
                 return result;
@@ -1808,12 +1832,20 @@ public class DevModeOperations {
             Arrays.sort(entries, Comparator.comparing(File::getName));
             for (File entry : entries) {
                 if (entry.isFile() && entry.getName().endsWith(".log")) {
-                    String stem = entry.getName().replaceAll("\\.[^.]+$", "");
+                    String name = entry.getName();
+                    String stem = name.substring(0, name.length() - 4); // strip ".log"
                     result.computeIfAbsent(resolveGroup(stem, stemToGroup), k -> new ArrayList<>()).add(entry.toPath());
                 } else if (entry.isDirectory()) {
                     File[] sub = entry.listFiles(f -> f.isFile() && f.getName().endsWith(".log"));
                     if (sub != null && sub.length > 0) {
-                        List<Path> list = result.computeIfAbsent(entry.getName(), k -> new ArrayList<>());
+                        // Use rename hint for the dir name if one exists (e.g. ffdc/ renamed → myffdc/).
+                        String dirKey   = LogDirectoryMonitor.DIR_PREFIX + entry.getName();
+                        String rawGroup = stemToGroup.getOrDefault(dirKey, entry.getName());
+                        // Strip DIR_PREFIX that hints use internally so the group key is a plain name.
+                        int pfx = LogDirectoryMonitor.DIR_PREFIX.length();
+                        String groupKey = rawGroup.startsWith(LogDirectoryMonitor.DIR_PREFIX)
+                                ? rawGroup.substring(pfx) : rawGroup;
+                        List<Path> list = result.computeIfAbsent(groupKey, k -> new ArrayList<>());
                         for (File f : sub) list.add(f.toPath());
                     }
                 }
@@ -1830,10 +1862,13 @@ public class DevModeOperations {
     }
 
     /**
-     * Opens the given log file using whatever editor Eclipse has configured for the file type.
-     * Any failure is reported to the user via an error dialog.
+     * Parses server.xml in the given server directory and returns a map of log file stem to
+     * canonical group name for each filename attribute declared in {@code <logging>} and
+     * {@code <accessLogging>} elements.
      *
-     * @param logFile Path to the log file to open.
+     * @param serverDir The Liberty server directory that contains server.xml.
+     *
+     * @return A map of log file stem to group name; empty when server.xml is absent or unreadable.
      */
     private static Map<String, String> readConfiguredLogStems(Path serverDir) {
         Map<String, String> map = new LinkedHashMap<>();
@@ -1841,9 +1876,7 @@ public class DevModeOperations {
         File serverXml = serverDir.resolve("server.xml").toFile();
         if (!serverXml.exists()) return map;
         try {
-            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            Document doc = dbf.newDocumentBuilder().parse(serverXml);
+            Document doc = SECURE_DBF.newDocumentBuilder().parse(serverXml);
             doc.getDocumentElement().normalize();
             NodeList logging = doc.getElementsByTagName("logging");
             for (int i = 0; i < logging.getLength(); i++) {
@@ -1863,7 +1896,14 @@ public class DevModeOperations {
         return map;
     }
 
-    /** Extracts the filename stem from a path attribute value and maps it to a group. */
+    /**
+     * Extracts the filename stem from a server.xml path attribute value and records
+     * the stem-to-group mapping in the given map.
+     *
+     * @param map   The map to populate.
+     * @param attr  The raw attribute value from server.xml, e.g. {@code logs/messages.log}.
+     * @param group The canonical group name to associate with the extracted stem.
+     */
     private static void putStem(Map<String, String> map, String attr, String group) {
         if (attr == null || attr.isEmpty()) return;
         String name = attr.replace('\\', '/');
@@ -1874,17 +1914,74 @@ public class DevModeOperations {
         if (!name.isEmpty()) map.put(name, group);
     }
 
-    /** Maps a log file stem to its group using config, rolled-file suffix stripping, then underscore split. */
+    /**
+     * Maps a log file stem to its display group. Lookup order: exact match in the config map,
+     * then base-name match after stripping a Liberty timestamp suffix, then the portion of the
+     * stem before the first underscore.
+     *
+     * @param stem        The log file stem, e.g. {@code messages} or {@code messages_26.09.21_13.11.36.0}.
+     * @param stemToGroup The config-derived and hint-merged stem-to-group map.
+     *
+     * @return The resolved group name for the stem.
+     */
     private static String resolveGroup(String stem, Map<String, String> stemToGroup) {
-        if (stemToGroup.containsKey(stem)) return stemToGroup.get(stem);
-        // Strip Liberty timestamp suffix e.g. "messages_26.09.21_13.11.36.0" → "messages"
-        String base = stem.replaceAll("(_\\d[\\d.]*)+$", "");
-        if (!base.equals(stem) && stemToGroup.containsKey(base)) return stemToGroup.get(base);
+        // 1. Exact match from server.xml config or rename hints.
+        String group = stemToGroup.get(stem);
+        if (group != null) return group;
+        // 2. Strip Liberty timestamp suffix segments "_DD.MM.YY_HH.MM.SS.N".
+        //    Each segment starts with '_' followed immediately by a digit.
+        //    Walk backwards stripping segments until no more match, then probe the map.
+        String base = stripTimestampSuffix(stem);
+        if (base != stem) {                              // reference equality: suffix was removed
+            group = stemToGroup.get(base);
+            if (group != null) return group;
+        }
+        // 3. Fall back to the portion before the first underscore (e.g. "messages").
         int us = stem.indexOf('_');
         return us > 0 ? stem.substring(0, us) : stem;
     }
 
-    /** Opens a log file in the Eclipse editor, reporting any failure to the user. */
+    /**
+     * Strips Liberty log-rotation timestamp suffixes from a file stem using plain
+     * string operations instead of regex. A suffix segment is {@code _} followed
+     * immediately by a digit (e.g. {@code _26.09.21_13.11.36.0}).
+     * Returns the same String instance (reference equality) when no suffix is present.
+     */
+    private static String stripTimestampSuffix(String stem) {
+        int end = stem.length();
+        while (end > 0) {
+            int us = stem.lastIndexOf('_', end - 1);
+            if (us < 0) break;
+            // A Liberty timestamp segment has a digit immediately after the '_'.
+            if (us + 1 < stem.length() && Character.isDigit(stem.charAt(us + 1))) {
+                end = us;
+            } else {
+                break;
+            }
+        }
+        return end == stem.length() ? stem : stem.substring(0, end);
+    }
+
+    /**
+     * Registers the given logs directory with the LogDirectoryMonitor for the specified project.
+     * The call is a no-op when the monitor is unavailable or the directory is already being watched.
+     *
+     * @param iProject The project whose logs directory is to be monitored.
+     * @param logsDir  The logs directory path to register.
+     */
+    private void registerWithMonitor(IProject iProject, Path logsDir) {
+        LogDirectoryMonitor monitor = LibertyDevPlugin.getLogDirectoryMonitor();
+        if (monitor == null || iProject == null) return;
+        monitor.register(iProject.getName(), logsDir, () ->
+                Display.getDefault().asyncExec(() -> refreshDashboardView(false)));
+    }
+
+    /**
+     * Opens the given log file in the Eclipse editor. The operation runs on the UI thread.
+     * Any failure is reported to the user via an error dialog.
+     *
+     * @param logFile Path to the log file to open.
+     */
     public void openServerLogFile(Path logFile) {
         Display.getDefault().asyncExec(() -> {
             try {
@@ -1906,19 +2003,18 @@ public class DevModeOperations {
     }
 
     /**
-     * Returns the server logs directory for the given project by reading the serverDirectory element
-     * from liberty-plugin-config.xml. Returns null if the file is absent or the directory does not exist.
+     * Returns the {@code logs/} sub-directory for the given project by reading the
+     * {@code serverDirectory} element from liberty-plugin-config.xml.
      *
      * @param projectModel The project model used to locate liberty-plugin-config.xml.
-     * @return The logs directory path, or null if it cannot be resolved.
+     *
+     * @return The logs directory path, or null when the config file is absent or the directory does not exist.
      */
     private Path resolveServerLogsDir(ProjectModel projectModel) {
         try {
             Path configXml = getLibertyPluginConfigXmlPath(projectModel);
             if (configXml == null || !configXml.toFile().exists()) return null;
-            DocumentBuilderFactory dbf = DocumentBuilderFactory.newInstance();
-            dbf.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
-            Document doc = dbf.newDocumentBuilder().parse(configXml.toFile());
+            Document doc = SECURE_DBF.newDocumentBuilder().parse(configXml.toFile());
             doc.getDocumentElement().normalize();
             NodeList list = doc.getElementsByTagName("serverDirectory");
             if (list.getLength() == 0) return null;

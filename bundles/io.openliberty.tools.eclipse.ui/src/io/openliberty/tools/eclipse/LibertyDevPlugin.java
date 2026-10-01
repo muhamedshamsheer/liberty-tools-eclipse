@@ -61,6 +61,9 @@ public class LibertyDevPlugin extends AbstractUIPlugin {
     /** Resource change listener instance. */
     private IResourceChangeListener resourceChangeListener;
 
+    /** Log directory monitor instance. */
+    private static LogDirectoryMonitor logDirectoryMonitor;
+
     /**
      * Constructor.
      */
@@ -88,6 +91,10 @@ public class LibertyDevPlugin extends AbstractUIPlugin {
         // Classify all projects in the workspace.
         DevModeOperations.getInstance().getWorkspaceModel().createNewCompleteWorkspaceModelWithClassify();
 
+        // Start the log directory monitor.
+        logDirectoryMonitor = new LogDirectoryMonitor();
+        logDirectoryMonitor.start();
+
         // Register a workspace listener for cleanup.
         registerListeners();
 
@@ -107,6 +114,10 @@ public class LibertyDevPlugin extends AbstractUIPlugin {
 
         DevModeOperations.getInstance().cancelRunningJobs();
         unregisterListeners();
+        if (logDirectoryMonitor != null) {
+            logDirectoryMonitor.stop();
+            logDirectoryMonitor = null;
+        }
         plugin = null;
         super.stop(context);
 
@@ -122,6 +133,11 @@ public class LibertyDevPlugin extends AbstractUIPlugin {
      */
     public static LibertyDevPlugin getDefault() {
         return plugin;
+    }
+
+    /** Returns the shared log directory monitor instance. */
+    public static LogDirectoryMonitor getLogDirectoryMonitor() {
+        return logDirectoryMonitor;
     }
 
     /**
