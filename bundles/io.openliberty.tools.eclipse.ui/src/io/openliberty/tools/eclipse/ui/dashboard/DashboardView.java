@@ -13,19 +13,29 @@
 package io.openliberty.tools.eclipse.ui.dashboard;
 
 import java.net.URI;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
+import org.eclipse.core.filesystem.EFS;
+import org.eclipse.core.filesystem.IFileStore;
 import org.eclipse.core.resources.IProject;
+import org.eclipse.ui.ide.IDE;
 import org.eclipse.debug.core.ILaunchManager;
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.IToolBarManager;
 import org.eclipse.jface.action.MenuManager;
+import org.eclipse.jface.action.Separator;
 import org.eclipse.jface.commands.ActionHandler;
 import org.eclipse.jface.resource.ImageDescriptor;
 import org.eclipse.jface.viewers.TreeViewer;
@@ -38,6 +48,7 @@ import org.eclipse.swt.events.ModifyEvent;
 import org.eclipse.swt.events.ModifyListener;
 import org.eclipse.swt.layout.GridData;
 import org.eclipse.swt.layout.GridLayout;
+import org.eclipse.swt.program.Program;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Listener;
 import org.eclipse.swt.widgets.Menu;
@@ -111,6 +122,8 @@ public class DashboardView extends ViewPart {
     public static final String APP_MENU_ACTION_VIEW_MVN_IT_REPORT = Messages.getMessage("dashboard_action_view_mvn_it_report");
     public static final String APP_MENU_ACTION_VIEW_MVN_UT_REPORT = Messages.getMessage("dashboard_action_view_mvn_ut_report");
     public static final String APP_MENU_ACTION_VIEW_GRADLE_TEST_REPORT = Messages.getMessage("dashboard_action_view_gradle_test_report");
+    public static final String APP_MENU_ACTION_SERVER = Messages.getMessage("dashboard_action_server");
+    public static final String APP_MENU_ACTION_OPEN_LOGS = Messages.getMessage("dashboard_action_open_logs");
     public static final String DASHBOARD_TOOLBAR_REFRESH = Messages.getMessage("dashboard_toolbar_refresh");
     public static final String DASHBOARD_TOOLBAR_EXPAND_ALL = Messages.getMessage("dashboard_toolbar_expand_all");
     public static final String DASHBOARD_TOOLBAR_COLLAPSE_ALL = Messages.getMessage("dashboard_toolbar_collapse_all");
@@ -132,6 +145,9 @@ public class DashboardView extends ViewPart {
     private Action filterAction;
     private Action expandAllAction;
     private Action collapseAllAction;
+
+    /** Action icon descriptor. */
+    private ImageDescriptor ActionImg;
 
     /** Tree viewer that holds the entries in the dashboard. */
     TreeViewer viewer;
@@ -612,6 +628,284 @@ public class DashboardView extends ViewPart {
                 ErrorHandler.processErrorMessage(Messages.getMessage("project_not_gradle_or_maven", projectName), true);
                 return;
             }
+
+            // Add the Server menu action.
+            addServerMenuAction(mgr, projectModel);
+        }
+    }
+
+    /**
+     * Adds the Server menu and Open Logs submenu to the context menu.
+     *
+     * @param mgr          The context menu manager.
+     * @param projectModel The selected project model.
+     */
+    private void addServerMenuAction(IMenuManager mgr, ProjectModel projectModel) {
+        mgr.add(new Separator());
+
+        MenuManager serverSubMenu = new MenuManager(APP_MENU_ACTION_SERVER);
+        serverSubMenu.setImageDescriptor(ActionImg);
+
+        File logsDir = getLogsDirectory(projectModel);
+        Map<String, List<File>> categorizedLogs = categorizeLogFiles(logsDir);
+
+        if (!categorizedLogs.isEmpty()) {
+            MenuManager openLogsSubMenu = new MenuManager(APP_MENU_ACTION_OPEN_LOGS);
+            populateLogsMenu(openLogsSubMenu, categorizedLogs, logsDir);
+            serverSubMenu.add(openLogsSubMenu);
+        } else {
+            Action disabledOpenLogsAction = new Action(APP_MENU_ACTION_OPEN_LOGS) {};
+            disabledOpenLogsAction.setEnabled(false);
+            serverSubMenu.add(disabledOpenLogsAction);
+        }
+
+        mgr.add(serverSubMenu);
+    }
+
+    /**
+     * Resolves the logs directory for the given project from liberty-plugin-config.xml.
+     *
+     * @param project The project model instance.
+     * @return The logs directory File object, or null if not found.
+     */
+    private File getLogsDirectory(ProjectModel project) {
+        try {
+            java.nio.file.Path configXmlPath = devModeOps.getLibertyPluginConfigXmlPath(project);
+            if (configXmlPath != null && java.nio.file.Files.exists(configXmlPath)) {
+                javax.xml.parsers.DocumentBuilderFactory dbf = javax.xml.parsers.DocumentBuilderFactory.newInstance();
+                dbf.setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true);
+                org.w3c.dom.Document doc = dbf.newDocumentBuilder().parse(configXmlPath.toFile());
+                org.w3c.dom.NodeList list = doc.getElementsByTagName("serverDirectory");
+                if (list != null && list.getLength() > 0) {
+                    String serverDirPath = list.item(0).getTextContent();
+                    if (serverDirPath != null && !serverDirPath.isBlank()) {
+                        File logsDir = new File(serverDirPath.strip(), "logs");
+                        if (logsDir.isDirectory()) {
+                            return logsDir;
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_UI, "Could not resolve serverDirectory from liberty-plugin-config.xml", e);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Categorizes log files from the logs directory into predefined groups.
+     * Recognized groups: Message Logs, Trace Logs, Console Logs, Access Logs, FFDC Logs.
+     *
+     * @param logsDir The logs directory File object.
+     * @return A map of category display names to lists of log files.
+     */
+    private Map<String, List<File>> categorizeLogFiles(File logsDir) {
+        Map<String, List<File>> categoryMap = new LinkedHashMap<>();
+        if (logsDir == null || !logsDir.isDirectory()) {
+            return categoryMap;
+        }
+
+        File[] files = logsDir.listFiles();
+        if (files == null) {
+            return categoryMap;
+        }
+
+        for (File file : files) {
+            if (file.getName().startsWith(".")) {
+                continue;
+            }
+            if (file.isDirectory() && "ffdc".equalsIgnoreCase(file.getName())) {
+                File[] ffdcFiles = file.listFiles((dir, name) -> {
+                    String lowerName = name.toLowerCase();
+                    return !name.startsWith(".")
+                           && (lowerName.startsWith("ffdc") || lowerName.startsWith("exception_summary"))
+                           && lowerName.endsWith(".log");
+                });
+                if (ffdcFiles != null && ffdcFiles.length > 0) {
+                    Collections.addAll(categoryMap.computeIfAbsent("FFDC Logs", k -> new ArrayList<>()), ffdcFiles);
+                }
+            } else if (file.isFile()) {
+                String category = identifyLogCategory(file);
+                if (category != null) {
+                    categoryMap.computeIfAbsent(category, k -> new ArrayList<>()).add(file);
+                }
+            }
+        }
+
+        // Sort files within each category: newest first (based on lastModified timestamp)
+        for (List<File> list : categoryMap.values()) {
+            list.sort((f1, f2) -> Long.compare(f2.lastModified(), f1.lastModified()));
+        }
+
+        return categoryMap;
+    }
+
+    /**
+     * Identifies which category a log file belongs to: Message Logs, Trace Logs, Console Logs, Access Logs, or null.
+     *
+     * @param file The file to identify.
+     * @return The category name string, or null if the file does not match any category.
+     */
+    private String identifyLogCategory(File file) {
+        String lowerName = file.getName().toLowerCase();
+
+        // Check default / known prefix patterns
+        if (lowerName.matches("messages([._].*)?\\.log")) {
+            return "Message Logs";
+        }
+        if (lowerName.matches("trace([._].*)?\\.log")) {
+            return "Trace Logs";
+        }
+        if (lowerName.matches("console([._].*)?\\.log")) {
+            return "Console Logs";
+        }
+        if (lowerName.matches("(http_?)?access([._].*)?\\.log")) {
+            return "Access Logs";
+        }
+
+        // For empty files with non-default names, do not show
+        if (file.length() == 0) {
+            return null;
+        }
+
+        // Check header content to detect custom-named Liberty log files
+        return identifyCategoryFromHeader(file);
+    }
+
+    /**
+     * Reads the header of a file to determine if it is a Liberty messages or trace log.
+     *
+     * @param file The file whose header to inspect.
+     * @return "Trace Logs", "Message Logs", or null if undetermined.
+     */
+    private String identifyCategoryFromHeader(File file) {
+        try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
+            String line;
+            int linesRead = 0;
+            boolean hasHeaderDelimiter = false;
+            boolean hasProduct = false;
+            boolean hasTraceSpec = false;
+
+            while ((line = reader.readLine()) != null && linesRead < 50) {
+                linesRead++;
+                String lower = line.strip().toLowerCase();
+                if (lower.startsWith("********************")) {
+                    hasHeaderDelimiter = true;
+                }
+                if (lower.startsWith("trace.specification") || lower.startsWith("trace.specifications")) {
+                    hasTraceSpec = true;
+                }
+                if (lower.startsWith("product =") || lower.startsWith("product=")) {
+                    hasProduct = true;
+                }
+                if (hasHeaderDelimiter && linesRead > 1 && lower.startsWith("********************")) {
+                    break;
+                }
+            }
+
+            if (hasTraceSpec) {
+                return "Trace Logs";
+            }
+            if (hasProduct) {
+                return "Message Logs";
+            }
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_UI, "Error reading header of " + file.getName(), e);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Populates the Open Logs menu using categorized log files.
+     * Flattened when a group contains 1 file, submenu when 2 or more.
+     * Limits list to 10 newest files, showing a 'More...' option when > 10.
+     *
+     * @param menuMgr         The menu manager to populate.
+     * @param categorizedLogs The categorized log files map.
+     * @param logsDir         The logs directory File object.
+     */
+    private void populateLogsMenu(MenuManager menuMgr, Map<String, List<File>> categorizedLogs, File logsDir) {
+        List<String> order = Arrays.asList("Message Logs", "Trace Logs", "Console Logs", "Access Logs", "FFDC Logs");
+        List<String> categories = new ArrayList<>(categorizedLogs.keySet());
+        categories.sort((c1, c2) -> {
+            int idx1 = order.indexOf(c1);
+            int idx2 = order.indexOf(c2);
+            if (idx1 != -1 && idx2 != -1) {
+                return Integer.compare(idx1, idx2);
+            }
+            if (idx1 != -1) return -1;
+            if (idx2 != -1) return 1;
+            return c1.compareToIgnoreCase(c2);
+        });
+
+        for (String category : categories) {
+            List<File> files = categorizedLogs.get(category);
+            if (files == null || files.isEmpty()) {
+                continue;
+            }
+
+            if (files.size() == 1) {
+                File singleFile = files.get(0);
+                Action openFileAction = new Action(singleFile.getName()) {
+                    @Override
+                    public void run() {
+                        openLogFileInEditor(singleFile);
+                    }
+                };
+                menuMgr.add(openFileAction);
+            } else {
+                MenuManager groupSubMenu = new MenuManager(category);
+                int count = Math.min(files.size(), 10);
+                for (int i = 0; i < count; i++) {
+                    File file = files.get(i);
+                    Action openFileAction = new Action(file.getName()) {
+                        @Override
+                        public void run() {
+                            openLogFileInEditor(file);
+                        }
+                    };
+                    groupSubMenu.add(openFileAction);
+                }
+
+                if (files.size() > 10) {
+                    File targetFolder = "FFDC Logs".equalsIgnoreCase(category) ? new File(logsDir, "ffdc") : logsDir;
+                    Action moreAction = new Action("More...") {
+                        @Override
+                        public void run() {
+                            if (targetFolder != null && targetFolder.exists()) {
+                                Program.launch(targetFolder.getAbsolutePath());
+                            }
+                        }
+                    };
+                    groupSubMenu.add(moreAction);
+                }
+
+                menuMgr.add(groupSubMenu);
+            }
+        }
+    }
+
+    /**
+     * Opens the specified log file in the Eclipse editor.
+     *
+     * @param file The log file to open.
+     */
+    private void openLogFileInEditor(File file) {
+        try {
+            IFileStore fileStore = EFS.getLocalFileSystem().getStore(file.toURI());
+            IWorkbenchWindow window = PlatformUI.getWorkbench().getActiveWorkbenchWindow();
+            if (window != null && window.getActivePage() != null) {
+                IDE.openEditorOnFileStore(window.getActivePage(), fileStore);
+            }
+        } catch (Exception e) {
+            if (Trace.isEnabled()) {
+                Trace.getTracer().trace(Trace.TRACE_UI, "Error opening log file: " + file.getAbsolutePath(), e);
+            }
+            ErrorHandler.processErrorMessage("Error opening log file: " + file.getName(), e, true);
         }
     }
 
@@ -619,7 +913,6 @@ public class DashboardView extends ViewPart {
      * Instantiates menu and toolbar actions.
      */
     private void createActions() {
-        ImageDescriptor ActionImg = null;
         ImageDescriptor refreshImg = null;
 
         // Get the image descriptors for the menu actions and toolbar.
